@@ -2,13 +2,20 @@ import json
 import os
 import re
 from dotenv import load_dotenv
-from groq import Groq
+from openai import OpenAI
 from tavily import TavilyClient
+from agents.runtime import run_blocking
 
 load_dotenv()
 
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+ollama_client = OpenAI(
+    base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
+    api_key=os.getenv("OLLAMA_API_KEY", "ollama"),
+    timeout=float(os.getenv("OUTBOUND_REQUEST_TIMEOUT_SECONDS", "30")),
+    max_retries=0,
+)
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 
 
 async def find_related_businesses(company_name: str, context: str | None = None) -> str:
@@ -21,12 +28,43 @@ async def find_related_businesses(company_name: str, context: str | None = None)
     if extra:
         query += f" {extra}"
 
-    search = tavily_client.search(query=query, search_depth="basic", max_results=5)
+    
+    search = await run_blocking(
+        tavily_client.search,
+        query=query,
+        search_depth="basic",
+        max_results=5,
+    )
+
+    if not isinstance(search, dict):
+        raise RuntimeError("Tavily returned an invalid search response")
+
+    results = search.get("results", [])
+
+    if not isinstance(results, list):
+        raise RuntimeError("Tavily returned an invalid search response")
+
     lines: list[str] = []
-    for res in search.get("results", [])[:5]:
+
+    for res in results[:5]:
+        if not isinstance(res, dict):
+            raise RuntimeError("Tavily returned an invalid search result")
+
         title = res.get("title") or ""
-        content = (res.get("content") or "").strip()
+        content = res.get("content") or ""
         url = res.get("url") or ""
+
+        if not isinstance(title, str):
+            title = ""
+        if not isinstance(content, str):
+            content = ""
+        if not isinstance(url, str):
+            url = ""
+
+        title = title.strip()
+        content = content.strip()
+        url = url.strip()
+
         if title or content:
             line = title
             if content:
@@ -34,6 +72,7 @@ async def find_related_businesses(company_name: str, context: str | None = None)
             if url:
                 line = f"{line} ({url})"
             lines.append(line)
+
 
     if not lines:
         return f"No related-business search results found for {company_name}."
@@ -66,8 +105,26 @@ async def resolve_target_companies(seed: str, context: str | None, count: int) -
     if extra:
         query += f" {extra[:320]}"
 
-    search = tavily_client.search(query=query, search_depth="basic", max_results=12)
+    
+    search = await run_blocking(
+        tavily_client.search,
+        query=query,
+        search_depth="basic",
+        max_results=12,
+    )
+
+    if not isinstance(search, dict):
+        raise RuntimeError("Tavily returned an invalid search response")
+
     results = search.get("results", []) or []
+
+    if not isinstance(results, list):
+        raise RuntimeError("Tavily returned an invalid search response")
+
+    for res in results:
+        if not isinstance(res, dict):
+            raise RuntimeError("Tavily returned an invalid search result")
+
 
     snippets: list[str] = []
     for res in results:
@@ -97,8 +154,9 @@ Snippets:
 
     names: list[str] = []
     try:
-        resp = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+        resp = await run_blocking(
+            ollama_client.chat.completions.create,
+            model=OLLAMA_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
         )
@@ -121,22 +179,49 @@ Snippets:
             deduped.append(nm)
     names = deduped[:need]
 
+    # if len(names) < need:
+    #     fb = await find_related_businesses(seed_clean, context=context)
+    #     for line in fb.split("\n"):
+    #         line = line.strip().lstrip("-•* ").strip()
+    #         if not line:
+    #             continue
+    #         part = line.split(":")[0].split("(")[0].strip()
+    #         if (
+    #             part
+    #             and part.lower() != seed_clean.lower()
+    #             and part.lower() not in seen
+    #         ):
+    #             seen.add(part.lower())
+    #             names.append(part)
+    #         if len(names) >= need:
+    #             break
+
     if len(names) < need:
         fb = await find_related_businesses(seed_clean, context=context)
-        for line in fb.split("\n"):
-            line = line.strip().lstrip("-•* ").strip()
-            if not line:
-                continue
-            part = line.split(":")[0].split("(")[0].strip()
-            if (
-                part
-                and part.lower() != seed_clean.lower()
-                and part.lower() not in seen
-            ):
-                seen.add(part.lower())
-                names.append(part)
-            if len(names) >= need:
-                break
+
+        if isinstance(fb, str) and fb.strip():
+            for line in fb.splitlines():
+                line = line.strip().lstrip("-•* ").strip()
+                if not line:
+                    continue
+
+                # Ignore the fallback's "no results" message.
+                if line.lower().startswith("no related-business search results"):
+                    continue
+
+                part = line.split(":")[0].split("(")[0].strip()
+
+                if (
+                    part
+                    and part.lower() != seed_clean.lower()
+                    and part.lower() not in seen
+                ):
+                    seen.add(part.lower())
+                    names.append(part)
+
+                if len(names) >= need:
+                    break
+
 
     out = [seed_clean]
     seen_out: set[str] = {seed_clean.lower()}
@@ -149,28 +234,28 @@ Snippets:
         seen_out.add(k)
         out.append(nm)
 
-    # Fill remaining slots from article titles (last resort)
-    while len(out) < n:
-        added = False
-        for res in results:
-            title = (res.get("title") or "").strip()
-            if not title:
-                continue
-            candidate = re.split(r"[\|–—\-]:\s*", title)[0].strip()
-            candidate = re.sub(r"^\d+\.\s*", "", candidate)
-            ck = candidate.lower()
-            if (
-                len(candidate) > 2
-                and ck != seed_clean.lower()
-                and ck not in seen_out
-            ):
-                seen_out.add(ck)
-                out.append(candidate)
-                added = True
-                break
-        if not added:
-            peer = f"Peer {len(out)} ({seed_clean} market)"
-            out.append(peer)
-            seen_out.add(peer.lower())
+        # Fill remaining slots from article titles (last resort)
+    # while len(out) < n:
+    #     added = False
+    #     for res in results:
+    #         title = (res.get("title") or "").strip()
+    #         if not title:
+    #             continue
+    #         candidate = re.split(r"[\|–—\-]:\s*", title)[0].strip()
+    #         candidate = re.sub(r"^\d+\.\s*", "", candidate)
+    #         ck = candidate.lower()
+    #         if (
+    #             len(candidate) > 2
+    #             and ck != seed_clean.lower()
+    #             and ck not in seen_out
+    #         ):
+    #             seen_out.add(ck)
+    #             out.append(candidate)
+    #             added = True
+    #             break
+    #     if not added:
+    #         peer = f"Peer {len(out)} ({seed_clean} market)"
+    #         out.append(peer)
+    #         seen_out.add(peer.lower())
 
-    return out[:n]
+    return out[:n]    
