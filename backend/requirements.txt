@@ -7,7 +7,6 @@ click==8.3.3
 colorama==0.4.6
 distro==1.9.0
 fastapi==0.136.1
-groq==1.2.0
 h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
@@ -25,3 +24,5 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 urllib3==2.6.3
 uvicorn==0.46.0
+openai==2.8.1
+pytest==8.4.2
